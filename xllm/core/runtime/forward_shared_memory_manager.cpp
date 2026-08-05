@@ -431,6 +431,7 @@ inline void write_linear_state_cache_ops(
     write_data(context.descriptor, cache_op.linear_state_id);
     write_data(context.descriptor, cache_op.restore_requested);
     write_data(context.descriptor, cache_op.restore_src_slot_id);
+    write_data(context.descriptor, cache_op.linear_state_read_src_id);
   }
 }
 
@@ -1223,6 +1224,7 @@ inline void read_linear_state_cache_ops(
     read_data(context, cache_op.linear_state_id);
     read_data(context, cache_op.restore_requested);
     read_data(context, cache_op.restore_src_slot_id);
+    read_data(context, cache_op.linear_state_read_src_id);
   }
 }
 
@@ -2376,6 +2378,7 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.dp_is_decode);
   read_vector(context, input_params.embedding.embedding_ids);
   read_vector(context, input_params.embedding.linear_state_ids);
+  read_vector(context, input_params.embedding.linear_state_read_src_ids);
   read_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   normalize_linear_state_ids(input_params.embedding.linear_state_ids,
                              input_params.meta.num_sequences);
@@ -2383,6 +2386,16 @@ inline void deserialize_forward_input_payload(
       !input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt)
+            .to(device, /*non_blocking=*/true);
+  }
+  // Mirror linear_state_ids for the out-of-place read source. Only
+  // materialize when non-empty so the flag-off path leaves the tensor
+  // undefined and the layer aliases the write index (in-place).
+  if (materialize_device_buffer &&
+      !input_params.embedding.linear_state_read_src_ids.empty()) {
+    input_params.embedding.linear_state_read_src_indices =
+        torch::tensor(input_params.embedding.linear_state_read_src_ids,
+                      torch::kInt)
             .to(device, /*non_blocking=*/true);
   }
   read_string_vector(context, input_params.embedding.request_ids);
@@ -2741,6 +2754,8 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor, input_params.parallel.dp_is_decode);
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
+  write_vector(context.descriptor,
+               input_params.embedding.linear_state_read_src_ids);
   write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);

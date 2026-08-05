@@ -501,6 +501,8 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params) {
         torch::IntArrayRef(linear_state_indices_host),
         torch::IntArrayRef(empty_host_args),
         torch::IntArrayRef(num_accepted_tokens),
+        torch::IntArrayRef(empty_host_args),  // out_cache_indices: graph-update
+                                              // decode is in-place
         task.activation_mode,
         task.pad_slot_id,
         task.run_mode);

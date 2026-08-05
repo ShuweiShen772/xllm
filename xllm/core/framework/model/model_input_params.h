@@ -783,6 +783,17 @@ struct ModelEmbeddingInput {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  // Out-of-place read-source slot ids of each sequence, aligned with
+  // linear_state_ids. -1 means "read == write" (in-place). Populated only at
+  // prefill chunk boundaries when enable_linear_state_out_of_place is on: the
+  // forward READS the recurrent state from this (frozen, soon-to-be-checkpoint)
+  // src slot and WRITES the new state to linear_state_ids (the fresh live dst
+  // slot). Empty otherwise, in which case the layer aliases linear_state_ids.
+  std::vector<int32_t> linear_state_read_src_ids;
+
+  // IntTensor: [n_seq], device-side dual of linear_state_read_src_ids.
+  torch::Tensor linear_state_read_src_indices;
+
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
@@ -803,6 +814,9 @@ struct ModelEmbeddingInput {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_src_ids = linear_state_read_src_ids;
+    out.linear_state_read_src_indices =
+        safe_to(linear_state_read_src_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -912,6 +926,11 @@ struct LinearStateCacheOp {
   // (linear_state_restore.cpp).
   bool restore_requested = false;
   int32_t restore_src_slot_id = -1;
+  // Out-of-place read source: at a prefill chunk boundary the forward READS the
+  // recurrent state from this (frozen) src slot and WRITES the new state to
+  // linear_state_id (the fresh live dst slot). -1 means in-place (read ==
+  // write), the default. Set only when enable_linear_state_out_of_place is on.
+  int32_t linear_state_read_src_id = -1;
 };
 
 struct ExpertInput {
@@ -1015,6 +1034,12 @@ struct ModelInputParams {
         !params.embedding.linear_state_ids.empty()) {
       params.embedding.linear_state_indices =
           torch::tensor(params.embedding.linear_state_ids, torch::kInt)
+              .to(device);
+    }
+    if (!params.embedding.linear_state_read_src_indices.defined() &&
+        !params.embedding.linear_state_read_src_ids.empty()) {
+      params.embedding.linear_state_read_src_indices =
+          torch::tensor(params.embedding.linear_state_read_src_ids, torch::kInt)
               .to(device);
     }
 

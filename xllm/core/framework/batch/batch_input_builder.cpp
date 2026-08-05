@@ -448,6 +448,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
     thread_state.embedding_ids.reserve(sequences_per_thread);
     thread_state.linear_state_ids.reserve(sequences_per_thread);
+    thread_state.linear_state_read_src_ids.reserve(sequences_per_thread);
     thread_state.request_ids.reserve(sequences_per_thread);
     thread_state.extra_token_ids.reserve(sequences_per_thread);
     thread_state.scheduled_mm_data_vec.reserve(sequences_per_thread);
@@ -520,6 +521,7 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 #endif
   state_.embedding_ids.reserve(total_seqs);
   state_.linear_state_ids.reserve(total_seqs);
+  state_.linear_state_read_src_ids.reserve(total_seqs);
   state_.request_ids.reserve(total_seqs);
   state_.extra_token_ids.reserve(total_seqs);
   state_.paged_kv_indices.reserve(total_paged_indices);
@@ -605,6 +607,10 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.linear_state_ids.insert(state_.linear_state_ids.end(),
                                    state.linear_state_ids.begin(),
                                    state.linear_state_ids.end());
+    state_.linear_state_read_src_ids.insert(
+        state_.linear_state_read_src_ids.end(),
+        state.linear_state_read_src_ids.begin(),
+        state.linear_state_read_src_ids.end());
     state_.linear_state_cache_ops.insert(state_.linear_state_cache_ops.end(),
                                          state.linear_state_cache_ops.begin(),
                                          state.linear_state_cache_ops.end());
@@ -902,6 +908,25 @@ void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
       // parallel build loop.
       sequence->set_pending_linear_save(linear_state_hashes[save_chunk_idx]);
     }
+  }
+  // Out-of-place read source: when enable_linear_state_out_of_place is on, the
+  // LINEAR leaf's allocate_for_sequence rotated the sequence onto a fresh dst
+  // slot this step and stashed the OLD slot as pending_linear_read_src. Emit
+  // that old id so the forward READS it while WRITING the new live slot
+  // (linear_state_id). Keep linear_state_read_src_ids row-aligned with
+  // linear_state_ids for every linear row in the batch (a non-rotation row
+  // emits -1 = read == write = in-place); leave the vector empty entirely when
+  // the flag is off so the layer aliases the read index (in-place).
+  if (::xllm::SchedulerConfig::get_instance()
+          .enable_linear_state_out_of_place()) {
+    const int32_t read_src_id = sequence->has_pending_linear_read_src()
+                                    ? sequence->pending_linear_read_src_id()
+                                    : -1;
+    linear_state_cache_op.linear_state_read_src_id = read_src_id;
+    state.linear_state_read_src_ids.emplace_back(read_src_id);
+    // Release the pin now that its id is captured; it only pertains to this
+    // step, mirroring how mounted_restore_src is taken above.
+    sequence->take_pending_linear_read_src();
   }
   state.linear_state_cache_ops.emplace_back(std::move(linear_state_cache_op));
 }
@@ -1264,11 +1289,17 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
 
   input_params.embedding.embedding_ids = std::move(state_.embedding_ids);
   input_params.embedding.linear_state_ids = std::move(state_.linear_state_ids);
+  input_params.embedding.linear_state_read_src_ids =
+      std::move(state_.linear_state_read_src_ids);
   input_params.linear_state_cache_ops =
       std::move(state_.linear_state_cache_ops);
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
+  }
+  if (!input_params.embedding.linear_state_read_src_ids.empty()) {
+    input_params.embedding.linear_state_read_src_indices = torch::tensor(
+        input_params.embedding.linear_state_read_src_ids, torch::kInt);
   }
   input_params.embedding.request_ids = std::move(state_.request_ids);
   input_params.embedding.extra_token_ids = std::move(state_.extra_token_ids);

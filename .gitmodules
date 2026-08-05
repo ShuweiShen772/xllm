@@ -20,7 +20,8 @@
 	fetchRecurseSubmodules = false
 [submodule "third_party/xllm_ops"]
 	path = third_party/xllm_ops
-	url = https://gitcode.com/xLLM-AI/xllm_ops.git
+	url = git@github.com:ShuweiShen772/xllm-ops.git
+	branch = feat/linear-state-out-of-place
 	fetchRecurseSubmodules = true
 [submodule "third_party/etcd_cpp_apiv3"]
 	path = third_party/etcd_cpp_apiv3

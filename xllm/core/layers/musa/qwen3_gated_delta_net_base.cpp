@@ -861,9 +861,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         torch::IntArrayRef(linear_state_indices_vec),
         torch::IntArrayRef(input_params.parallel.has_initial_state),
         num_accepted_tokens_opt,
-        1,   // activation_mode (silu)
-        -1,  // pad_slot_id
-        0);  // run_mode forward
+        torch::IntArrayRef(),  // out_cache_indices: MLU is in-place (NPU-only
+                               // feature)
+        1,                     // activation_mode (silu)
+        -1,                    // pad_slot_id
+        0);                    // run_mode forward
 
     mixed_qkv = reshape_qkvz_with_pad(attn_metadata, mixed_qkv);
     mixed_qkv = mixed_qkv.transpose(1, 2);

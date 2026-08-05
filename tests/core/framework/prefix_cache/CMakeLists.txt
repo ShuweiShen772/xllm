@@ -26,3 +26,13 @@ cc_test(
     :block
     GTest::gtest_main
 )
+
+cc_test(
+  NAME
+    linear_state_no_overwrite_test
+  SRCS
+    linear_state_no_overwrite_test.cpp
+  DEPS
+    :block
+    GTest::gtest_main
+)

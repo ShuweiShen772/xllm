@@ -183,6 +183,8 @@ DECLARE_int32(max_concurrent_requests);
 
 DECLARE_bool(enable_schedule_overlap);
 
+DECLARE_bool(enable_linear_state_out_of_place);
+
 DECLARE_double(prefill_scheduling_memory_usage_threshold);
 
 DECLARE_int32(max_reconnect_count);

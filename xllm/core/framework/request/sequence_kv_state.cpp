@@ -140,6 +140,7 @@ void KVCacheState::erase_blocks(BlockType type) {
   if (type == BlockType::LINEAR) {
     pending_linear_save_hash_.reset();
     linear_restore_src_block_.reset();
+    pending_linear_read_src_.reset();
   }
 }
 
@@ -380,6 +381,7 @@ void KVCacheState::reset() {
   next_transfer_block_idx_ = 0;
   pending_linear_save_hash_.reset();
   linear_restore_src_block_.reset();
+  pending_linear_read_src_.reset();
   next_group_transfer_block_idxes_.clear();
 }
 

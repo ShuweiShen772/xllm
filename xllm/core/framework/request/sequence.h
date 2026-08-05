@@ -242,6 +242,18 @@ class Sequence final {
   std::optional<Block> take_linear_restore_src_block() {
     return kv_state_.take_linear_restore_src_block();
   }
+  void set_pending_linear_read_src(Block&& block) {
+    kv_state_.set_pending_linear_read_src(std::move(block));
+  }
+  bool has_pending_linear_read_src() const {
+    return kv_state_.has_pending_linear_read_src();
+  }
+  int32_t pending_linear_read_src_id() const {
+    return kv_state_.pending_linear_read_src_id();
+  }
+  std::optional<Block> take_pending_linear_read_src() {
+    return kv_state_.take_pending_linear_read_src();
+  }
   Block copy_block(BlockType type) const { return kv_state_.copy_block(type); }
   const std::string& request_id() const { return request_id_; }
   // get input embedding

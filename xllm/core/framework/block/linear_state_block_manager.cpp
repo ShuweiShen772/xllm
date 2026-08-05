@@ -21,6 +21,7 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "framework/config/scheduler_config.h"
 #include "framework/request/sequence.h"
 
 namespace xllm {
@@ -82,6 +83,32 @@ LinearStateBlockManager::allocate_for_sequence(Sequence* seq,
       seq->has_linear_state_slot() && !prefix_cache_->contains(*pending_hash);
   Block new_live_slot = should_apply_save ? allocate() : Block();
   if (new_live_slot.is_valid()) {
+    // Out-of-place rotation (enable_linear_state_out_of_place): instead of
+    // rotating onto the fresh slot and having the next forward D2D-copy the
+    // frozen checkpoint into it, we keep the OLD slot as this step's READ
+    // source and let the forward WRITE straight into the fresh dst. The old
+    // slot is never overwritten, so it freezes as the checkpoint with zero
+    // copy -- the D2D that class-B restore performs is eliminated. The batch
+    // builder reads the old slot id from pending_linear_read_src and emits it
+    // as linear_state_read_src_id; the sequence's live slot becomes the dst so
+    // subsequent steps continue in place on it.
+    const bool out_of_place =
+        SchedulerConfig::get_instance().enable_linear_state_out_of_place();
+    if (out_of_place) {
+      // Freeze the old slot as the checkpoint under the recorded hash (its
+      // contents already match the boundary state -- the previous forward
+      // wrote it in place). Pin a second alias as this step's read source so
+      // the forward reads it while writing the fresh dst; no restore source is
+      // mounted because there is nothing to copy.
+      Block checkpoint_slot = seq->copy_block(BlockType::LINEAR);
+      seq->set_pending_linear_read_src(Block(checkpoint_slot));
+      insert_with_recorded_hash(std::move(checkpoint_slot), *pending_hash);
+      deallocate(seq->kv_state().blocks(BlockType::LINEAR));
+      seq->kv_state().mutable_blocks(BlockType::LINEAR)->clear();
+      std::vector<Block> rotated;
+      rotated.emplace_back(std::move(new_live_slot));
+      return rotated;
+    }
     // Pin the warm slot into the checkpoint index (refcount+1) and mount a
     // second alias as the class-B restore source the next step's builder
     // consumes (copy old->new). copy_block leaves the slot in the sequence too.

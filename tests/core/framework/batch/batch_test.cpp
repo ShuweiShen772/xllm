@@ -1054,6 +1054,60 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       torch::tensor({{3.0f, 4.0f}})));
 }
 
+// Out-of-place linear-state rotation carries a per-sequence read-source slot id
+// both on the embedding vector (linear_state_read_src_ids) and on each
+// LinearStateCacheOp (linear_state_read_src_id). Under PD disaggregation the
+// scheduler serializes ForwardInput to the remote worker through shared memory;
+// if these fields were dropped from the serializer the worker would silently
+// fall back to in-place writes and corrupt the checkpoint with no error. This
+// round-trips a ForwardInput through the real writer/reader path and asserts
+// both survive -- guarding the "PD serialization drops the field" silent
+// failure called out in the change plan.
+TEST(BatchTest, ForwardInputRoundTripPreservesLinearStateReadSrc) {
+  ForwardInput input;
+  input.input_params.embedding.linear_state_ids = {5, 7};
+  input.input_params.embedding.linear_state_read_src_ids = {3, -1};
+  input.input_params.meta.num_sequences = 2;
+
+  LinearStateCacheOp op0;
+  op0.linear_state_id = 5;
+  op0.linear_state_read_src_id = 3;
+  LinearStateCacheOp op1;
+  op1.linear_state_id = 7;
+  op1.linear_state_read_src_id = -1;
+  input.input_params.linear_state_cache_ops = {op0, op1};
+
+  bool is_creator = false;
+  auto shm_name = ForwardSharedMemoryManager::create_unique_name(
+      "batch_test_linear_read_src",
+      /*dp_group=*/0,
+      ForwardType::RAW_INPUT,
+      /*rank=*/0);
+  ForwardSharedMemoryManager writer_manager(
+      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  bool is_reader_creator = false;
+  ForwardSharedMemoryManager reader_manager(
+      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+
+  ASSERT_TRUE(writer_manager.input_write(input));
+
+  ForwardInput round_trip;
+  reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
+
+  // The embedding-level read-source vector survives verbatim.
+  EXPECT_EQ(round_trip.input_params.embedding.linear_state_read_src_ids,
+            (std::vector<int32_t>{3, -1}));
+  // Each cache op's read-source id survives (a -1 row means "read == write",
+  // i.e. that sequence stays in-place even in out-of-place mode).
+  ASSERT_EQ(round_trip.input_params.linear_state_cache_ops.size(), 2u);
+  EXPECT_EQ(round_trip.input_params.linear_state_cache_ops[0]
+                .linear_state_read_src_id,
+            3);
+  EXPECT_EQ(round_trip.input_params.linear_state_cache_ops[1]
+                .linear_state_read_src_id,
+            -1);
+}
+
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {
   const bool old_enable_block_copy_kernel =
       ::xllm::BeamSearchConfig::get_instance().enable_block_copy_kernel();

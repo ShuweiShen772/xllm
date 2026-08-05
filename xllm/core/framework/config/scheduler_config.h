@@ -55,7 +55,8 @@ class SchedulerConfig final {
          "enable_online_preempt_offline",
          "aggressive_coeff",
          "starve_threshold",
-         "enable_starve_prevent"}};
+         "enable_starve_prevent",
+         "enable_linear_state_out_of_place"}};
     return kOptionCategory;
   }
 
@@ -88,6 +89,13 @@ class SchedulerConfig final {
   PROPERTY(double, starve_threshold) = 1.0;
 
   PROPERTY(bool, enable_starve_prevent) = true;
+
+  // When true, Qwen3.5 GDN linear-state writes at prefill chunk boundaries go
+  // out-of-place: the operator reads the old (src) slot and writes the new
+  // recurrent state to a freshly allocated (dst) slot, freezing the old slot
+  // into an immutable checkpoint. Default false keeps the in-place overwrite
+  // behavior (dst == src) so production is byte-identical until enabled.
+  PROPERTY(bool, enable_linear_state_out_of_place) = false;
 };
 
 }  // namespace xllm

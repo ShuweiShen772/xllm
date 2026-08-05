@@ -352,18 +352,21 @@ torch::Tensor run_causal_conv1d_graph_update(
   }
 
   output = torch::empty_like(x);
-  xllm::kernel::causal_conv1d_out(output,
-                                  x,
-                                  weight,
-                                  conv_state,
-                                  bias,
-                                  torch::IntArrayRef(query_start_loc),
-                                  torch::IntArrayRef(cache_indices),
-                                  torch::IntArrayRef(empty_host_args),
-                                  torch::IntArrayRef(num_accepted_tokens),
-                                  xllm::npu::kCausalConv1dActivationSilu,
-                                  xllm::npu::kCausalConv1dGraphPadSlotId,
-                                  xllm::npu::kCausalConv1dRunModeUpdate);
+  xllm::kernel::causal_conv1d_out(
+      output,
+      x,
+      weight,
+      conv_state,
+      bias,
+      torch::IntArrayRef(query_start_loc),
+      torch::IntArrayRef(cache_indices),
+      torch::IntArrayRef(empty_host_args),
+      torch::IntArrayRef(num_accepted_tokens),
+      torch::IntArrayRef(
+          empty_host_args),  // out_cache_indices: decode is in-place
+      xllm::npu::kCausalConv1dActivationSilu,
+      xllm::npu::kCausalConv1dGraphPadSlotId,
+      xllm::npu::kCausalConv1dRunModeUpdate);
   c10_npu::NPUTaskGroupHandle handle = c10_npu::graph_task_group_end(stream);
 
   xllm::npu::CausalConv1dGraphTask task;
@@ -612,6 +615,21 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       get_checkpoint_stride(conv_cache, ssm_cache);
   torch::Tensor linear_state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+  // Out-of-place read source (enable_linear_state_out_of_place): at a prefill
+  // chunk-boundary rotation the sequence's live slot is the fresh dst that the
+  // forward WRITES, while the recurrent state to READ lives in the OLD (frozen)
+  // slot carried in linear_state_read_src_indices. When that tensor is
+  // undefined (flag off or non-boundary rows) the read aliases the write index,
+  // i.e. in-place read == write, byte-identical to the original behavior.
+  torch::Tensor linear_state_read_base_indices = linear_state_base_indices;
+  if (input_params.embedding.linear_state_read_src_indices.defined()) {
+    torch::Tensor read_src_logical =
+        get_linear_state_read_src_indices(input_params, device);
+    if (read_src_logical.defined()) {
+      linear_state_read_base_indices =
+          build_linear_state_base_indices(read_src_logical, checkpoint_stride);
+    }
+  }
   auto graph_context = input_params.graph.acl_graph_task_update_context;
   const bool register_conv1d_graph_update =
       graph_context != nullptr && graph_context->capturing;
@@ -621,6 +639,37 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     std::vector<int64_t> linear_state_indices_vec(
         input_params.embedding.linear_state_ids.begin(),
         input_params.embedding.linear_state_ids.end());
+    // Out-of-place conv (enable_linear_state_out_of_place): the sequence's live
+    // slot (linear_state_ids) is the fresh dst the conv kernel WRITES, while it
+    // READS the recurrent state from the old (frozen) slot in
+    // linear_state_read_src_ids. Build a per-row read/write index pair:
+    //   read (cache_indices)      = old src slot, falling back to the live slot
+    //                               where the row carries -1 (in-place row)
+    //   write (out_cache_indices) = the live dst slot
+    // When the read-src plumbing is absent (flag off) the write vector stays
+    // empty so the kernel writes to cache_indices == live slot --
+    // byte-identical in-place behavior.
+    std::vector<int64_t> conv_read_src_indices_vec;
+    std::vector<int64_t> conv_out_cache_indices_vec;
+    const std::vector<int32_t>& read_src_ids =
+        input_params.embedding.linear_state_read_src_ids;
+    if (!read_src_ids.empty()) {
+      const size_t n = linear_state_indices_vec.size();
+      conv_read_src_indices_vec.resize(n);
+      conv_out_cache_indices_vec.resize(n);
+      for (size_t i = 0; i < n; ++i) {
+        const int64_t live = linear_state_indices_vec[i];
+        const int64_t src = (i < read_src_ids.size() && read_src_ids[i] >= 0)
+                                ? static_cast<int64_t>(read_src_ids[i])
+                                : live;
+        conv_read_src_indices_vec[i] = src;
+        conv_out_cache_indices_vec[i] = live;
+      }
+    }
+    const bool conv_out_of_place = !conv_out_cache_indices_vec.empty();
+    const std::vector<int64_t>& conv_cache_indices_vec =
+        conv_out_of_place ? conv_read_src_indices_vec
+                          : linear_state_indices_vec;
     torch::Tensor conv_input = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
 
     const bool direct_qkv_model_supported =
@@ -668,8 +717,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
               conv_weight,
               conv_cache,
               torch::IntArrayRef(input_params.parallel.query_start_loc),
-              torch::IntArrayRef(linear_state_indices_vec),
+              torch::IntArrayRef(conv_cache_indices_vec),
               torch::IntArrayRef(input_params.parallel.has_initial_state),
+              torch::IntArrayRef(conv_out_cache_indices_vec),
               local_q_heads,
               local_v_heads,
               head_k_dim_,
@@ -682,9 +732,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
           conv_cache,
           std::optional<torch::Tensor>(),  // bias (no bias for qwen3)
           torch::IntArrayRef(input_params.parallel.query_start_loc),
-          torch::IntArrayRef(linear_state_indices_vec),
+          torch::IntArrayRef(conv_cache_indices_vec),
           torch::IntArrayRef(input_params.parallel.has_initial_state),
           num_accepted_tokens_opt,
+          torch::IntArrayRef(conv_out_cache_indices_vec),
           xllm::npu::kCausalConv1dActivationSilu,
           xllm::npu::kCausalConv1dGraphPadSlotId,
           xllm::npu::kCausalConv1dRunModeForward);
@@ -748,6 +799,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             torch::IntArrayRef(linear_state_indices_host),
             torch::IntArrayRef(std::vector<int64_t>()),
             torch::IntArrayRef(num_accepted),
+            torch::IntArrayRef(
+                std::vector<int64_t>()),  // out_cache_indices: spec verify is
+                                          // in-place
             xllm::npu::kCausalConv1dActivationSilu,
             xllm::npu::kCausalConv1dGraphPadSlotId,
             xllm::npu::kCausalConv1dRunModeUpdate);
@@ -912,7 +966,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     // Get initial state from ssm_cache for sequences with previous state
     // Shape: [batch_size, num_heads, head_k_dim, head_v_dim]
     torch::Tensor initial_state_tensor =
-        torch::index_select(ssm_cache, 0, linear_state_base_indices);
+        torch::index_select(ssm_cache, 0, linear_state_read_base_indices);
     CHECK_EQ(input_params.parallel.has_initial_state.size(),
              input_params.embedding.linear_state_ids.size())
         << "has_initial_state must be sequence-scoped.";
@@ -1096,6 +1150,29 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
   return torch::tensor(
       input_params.embedding.linear_state_ids,
       torch::TensorOptions().dtype(torch::kInt).device(device));
+}
+
+torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_read_src_indices(
+    const ModelInputParams& input_params,
+    const torch::Device& device) const {
+  // Out-of-place read source: rows carry the OLD (frozen) slot id at a
+  // rotation boundary, or -1 for in-place rows. Fetch the read-src tensor and
+  // fall back to the write (live) logical indices wherever the entry is -1, so
+  // non-rotation rows read == write (in-place). Returns an undefined tensor
+  // when no read-src plumbing is present (flag off), signaling the caller to
+  // alias the write index.
+  if (!input_params.embedding.linear_state_read_src_indices.defined()) {
+    return torch::Tensor();
+  }
+  torch::Tensor read_src = input_params.embedding.linear_state_read_src_indices;
+  if (read_src.device() != device || read_src.scalar_type() != torch::kInt) {
+    read_src =
+        read_src.to(torch::TensorOptions().dtype(torch::kInt).device(device),
+                    /*non_blocking=*/true,
+                    /*copy=*/true);
+  }
+  torch::Tensor write_logical = get_linear_state_indices(input_params, device);
+  return torch::where(read_src < 0, write_logical, read_src).contiguous();
 }
 
 torch::Tensor Qwen3GatedDeltaNetBaseImpl::reshape_projected_tokens_with_pad(

@@ -174,6 +174,9 @@ class HybridConv1dMockLM final : public CausalLM {
             torch::IntArrayRef(cache_indices),
             torch::IntArrayRef(empty_host_args),
             torch::IntArrayRef(nat_ref),
+            torch::IntArrayRef(
+                empty_host_args),  // out_cache_indices: graph-update decode is
+                                   // in-place
             /*activation_mode=*/npu::kCausalConv1dActivationSilu,
             /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
             /*run_mode=*/npu::kCausalConv1dRunModeUpdate);
@@ -210,6 +213,9 @@ class HybridConv1dMockLM final : public CausalLM {
             torch::IntArrayRef(cache_indices),
             torch::IntArrayRef(empty_host_args),
             torch::IntArrayRef(nat_ref),
+            torch::IntArrayRef(
+                empty_host_args),  // out_cache_indices: graph-update decode is
+                                   // in-place
             /*activation_mode=*/npu::kCausalConv1dActivationSilu,
             /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
             /*run_mode=*/npu::kCausalConv1dRunModeUpdate);

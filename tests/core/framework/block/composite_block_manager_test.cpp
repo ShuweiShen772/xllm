@@ -17,9 +17,13 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <optional>
 #include <set>
 
+#include "framework/block/block_manager_pool_test_peer.h"
 #include "framework/block/block_utils.h"
+#include "framework/block/linear_state_block_manager.h"
 #include "framework/config/scheduler_config.h"
 #include "framework/request/request.h"
 #include "framework/request/sequence.h"
@@ -27,6 +31,7 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "platform/device.h"
 #include "platform/platform.h"
+#include "util/hash_util.h"
 
 namespace xllm {
 
@@ -866,6 +871,126 @@ TEST(CompositeBlockManagerTest, DecodeRoleLinearDefaultStrideDoesNotAbort) {
 
   SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill() =
       original_chunk_stride;
+}
+
+namespace {
+
+// Distinct prefix hash keyed by one byte (mirrors the linear-state prefix cache
+// tests) so a boundary checkpoint can be referenced by an easy-to-read tag.
+XXH3Key make_linear_hash(uint8_t tag) {
+  std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN> bytes{};
+  bytes.fill(tag);
+  return XXH3Key(bytes.data());
+}
+
+// RAII toggle for the out-of-place flag so a test's effect never leaks into the
+// singleton and neighboring tests.
+class OutOfPlaceFlagGuard final {
+ public:
+  explicit OutOfPlaceFlagGuard(bool value)
+      : old_value_(SchedulerConfig::get_instance()
+                       .enable_linear_state_out_of_place()) {
+    SchedulerConfig::get_instance().enable_linear_state_out_of_place() = value;
+  }
+  ~OutOfPlaceFlagGuard() {
+    SchedulerConfig::get_instance().enable_linear_state_out_of_place() =
+        old_value_;
+  }
+
+ private:
+  bool old_value_;
+};
+
+}  // namespace
+
+// Out-of-place rotation, flag ON: at a save boundary allocate_for_sequence must
+// rotate the sequence onto a FRESH dst slot, freeze the OLD slot into the
+// checkpoint index, stash the OLD slot as the read source (so the forward reads
+// it while writing dst), and mount NO restore source (the D2D that class-B
+// restore performs is eliminated). This is the scheduler-side contract of §2f.
+TEST(CompositeBlockManagerTest,
+     LinearOutOfPlaceRotationFreezesSrcAndStashesReadSrc) {
+  OutOfPlaceFlagGuard flag_guard(/*value=*/true);
+  LinearStateBlockManager cache(/*num_slots=*/8,
+                                /*chunk_stride=*/16,
+                                /*enable_prefix_cache=*/true);
+
+  Sequence seq = MakeTestSequence(0, std::vector<int32_t>(32, 1));
+  Block live = cache.allocate();
+  ASSERT_TRUE(live.is_valid());
+  const int32_t old_slot = live.id();
+  std::vector<Block> live_blocks;
+  live_blocks.emplace_back(std::move(live));
+  seq.add_blocks(BlockType::LINEAR, live_blocks);
+  ASSERT_TRUE(seq.has_linear_state_slot());
+  ASSERT_EQ(seq.get_linear_state_slot_id(), old_slot);
+
+  const XXH3Key boundary = make_linear_hash(11);
+  seq.set_pending_linear_save(boundary);
+
+  std::optional<std::vector<Block>> rotated =
+      cache.allocate_for_sequence(&seq, /*num_tokens=*/16);
+  ASSERT_TRUE(rotated.has_value());
+  ASSERT_EQ(rotated->size(), 1u);
+
+  // A fresh dst slot, distinct from the old one, is returned for the composite
+  // to install as the new live slot.
+  const int32_t dst_slot = rotated->front().id();
+  EXPECT_TRUE(rotated->front().is_valid());
+  EXPECT_NE(dst_slot, old_slot);
+
+  // The old slot is frozen into the checkpoint index under the boundary hash.
+  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, boundary));
+  Block checkpoint = BlockManagerPoolTestPeer::match(&cache, boundary);
+  ASSERT_TRUE(checkpoint.is_valid());
+  EXPECT_EQ(checkpoint.id(), old_slot);
+
+  // The old slot is stashed as this step's read source (id == old slot), and NO
+  // restore source is mounted (no D2D to schedule -- that is what out-of-place
+  // eliminates).
+  EXPECT_TRUE(seq.has_pending_linear_read_src());
+  EXPECT_EQ(seq.pending_linear_read_src_id(), old_slot);
+  EXPECT_FALSE(seq.has_linear_restore_src_block());
+}
+
+// Same boundary scenario, flag OFF: allocate_for_sequence must take the
+// original in-place rotation path -- mount a restore source (the class-B D2D
+// copy old->new) and stash NO read source. This is the byte-identical fallback
+// that keeps production behavior unchanged while the flag is off.
+TEST(CompositeBlockManagerTest,
+     LinearInPlaceRotationMountsRestoreSrcWhenFlagOff) {
+  OutOfPlaceFlagGuard flag_guard(/*value=*/false);
+  LinearStateBlockManager cache(/*num_slots=*/8,
+                                /*chunk_stride=*/16,
+                                /*enable_prefix_cache=*/true);
+
+  Sequence seq = MakeTestSequence(0, std::vector<int32_t>(32, 1));
+  Block live = cache.allocate();
+  ASSERT_TRUE(live.is_valid());
+  const int32_t old_slot = live.id();
+  std::vector<Block> live_blocks;
+  live_blocks.emplace_back(std::move(live));
+  seq.add_blocks(BlockType::LINEAR, live_blocks);
+
+  const XXH3Key boundary = make_linear_hash(12);
+  seq.set_pending_linear_save(boundary);
+
+  std::optional<std::vector<Block>> rotated =
+      cache.allocate_for_sequence(&seq, /*num_tokens=*/16);
+  ASSERT_TRUE(rotated.has_value());
+  ASSERT_EQ(rotated->size(), 1u);
+  EXPECT_NE(rotated->front().id(), old_slot);
+
+  // Old slot still becomes a checkpoint under the boundary hash.
+  EXPECT_TRUE(BlockManagerPoolTestPeer::contains(&cache, boundary));
+  Block checkpoint = BlockManagerPoolTestPeer::match(&cache, boundary);
+  ASSERT_TRUE(checkpoint.is_valid());
+  EXPECT_EQ(checkpoint.id(), old_slot);
+
+  // In-place path mounts a restore source (the D2D copy the next step consumes)
+  // and stashes NO read source.
+  EXPECT_TRUE(seq.has_linear_restore_src_block());
+  EXPECT_FALSE(seq.has_pending_linear_read_src());
 }
 
 }  // namespace xllm

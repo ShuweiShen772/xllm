@@ -73,6 +73,10 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
   torch::Tensor get_linear_state_indices(const ModelInputParams& input_params,
                                          const torch::Device& device) const;
 
+  torch::Tensor get_linear_state_read_src_indices(
+      const ModelInputParams& input_params,
+      const torch::Device& device) const;
+
   std::pair<torch::Tensor, torch::Tensor> project_padded_inputs(
       const torch::Tensor& hidden_states,
       const AttentionMetadata& attn_metadata);

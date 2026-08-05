@@ -1,6 +1,13 @@
 #pragma once
 
 #include <Mooncake/mooncake-store/include/client_service.h>
+// Mooncake's client_service.h transitively includes <liburing.h> ->
+// <linux/fs.h>, which defines a BLOCK_SIZE macro. That macro then clobbers the
+// `static const size_t BLOCK_SIZE` members in downstream headers (brpc's
+// single_threaded_pool.h, moodycamel concurrentqueue.h), turning them into a
+// parse error. Drop the fs.h macro here so those C++ identifiers survive; no
+// xllm code relies on the linux/fs.h BLOCK_SIZE value.
+#undef BLOCK_SIZE
 #include <glog/logging.h>
 
 #include <string>

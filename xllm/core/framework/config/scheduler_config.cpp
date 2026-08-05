@@ -74,6 +74,12 @@ DEFINE_bool(enable_starve_prevent,
             true,
             "Whether to enable anti-starvation in MixScheduler.");
 
+DEFINE_bool(enable_linear_state_out_of_place,
+            false,
+            "Whether Qwen3.5 GDN linear-state writes go out-of-place "
+            "(read src slot, write dst slot) at prefill chunk boundaries. "
+            "Default false keeps in-place overwrite behavior.");
+
 namespace xllm {
 
 void SchedulerConfig::from_flags() {
@@ -92,6 +98,7 @@ void SchedulerConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(aggressive_coeff);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(starve_threshold);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_starve_prevent);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_linear_state_out_of_place);
 }
 
 void SchedulerConfig::from_json(const JsonReader& json) {
@@ -145,6 +152,8 @@ void SchedulerConfig::append_config_json(
       config_json, default_config, starve_threshold);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_starve_prevent);
+  APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
+      config_json, default_config, enable_linear_state_out_of_place);
 }
 
 SchedulerConfig& SchedulerConfig::get_instance() {

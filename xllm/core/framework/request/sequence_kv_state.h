@@ -166,6 +166,30 @@ class KVCacheState {
     return block;
   }
 
+  // Out-of-place linear-state rotation source, pre-set on the scheduler thread
+  // by allocate_for_sequence at a prefill chunk boundary (only when
+  // enable_linear_state_out_of_place is on). At the rotation step the live slot
+  // is rotated to a fresh dst while this holds a handle to the OLD slot; the
+  // batch builder reads its id into the cache op's linear_state_read_src_id so
+  // the forward READS the old (frozen, soon-to-be-checkpoint) slot and WRITES
+  // the new state to the fresh live dst slot. Cleared by erase_blocks(LINEAR)
+  // and reset().
+  void set_pending_linear_read_src(Block&& block) {
+    pending_linear_read_src_ = std::move(block);
+  }
+  bool has_pending_linear_read_src() const {
+    return pending_linear_read_src_.has_value();
+  }
+  int32_t pending_linear_read_src_id() const {
+    return pending_linear_read_src_.has_value() ? pending_linear_read_src_->id()
+                                                : -1;
+  }
+  std::optional<Block> take_pending_linear_read_src() {
+    std::optional<Block> block = std::move(pending_linear_read_src_);
+    pending_linear_read_src_.reset();
+    return block;
+  }
+
   // Return a Block copy (refcount+1) of the singleton slot without removing it.
   Block copy_block(BlockType type) const;
 
@@ -246,6 +270,12 @@ class KVCacheState {
   // checkpoint slot cannot be evicted while pending. Cleared by
   // erase_blocks(LINEAR) and reset().
   std::optional<Block> linear_restore_src_block_;
+
+  // Out-of-place rotation source (see set_pending_linear_read_src). Holds a
+  // handle to the OLD slot the forward reads from at a rotation step while the
+  // sequence's live slot is the fresh dst. Cleared by erase_blocks(LINEAR) and
+  // reset().
+  std::optional<Block> pending_linear_read_src_;
 };
 
 }  // namespace xllm
