@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "deepseekv32_detector.h"
 
+#include <cstdint>
 #include <gtest/gtest.h>
 
 #include <nlohmann/json.hpp>
@@ -1030,6 +1031,65 @@ TEST_F(DeepSeekV4DetectorTest, StreamingHandlesToolCallsTokenSplit) {
   EXPECT_EQ(tool_calls_found, 1);
   nlohmann::json params = nlohmann::json::parse(accumulated_args);
   EXPECT_EQ(params["city"], "Beijing");
+}
+
+TEST_F(DeepSeekV4DetectorTest, StreamingArgumentsStayValidWhenKeysReorder) {
+  std::vector<std::string> chunks = {
+      "<｜DSML｜tool_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"date\" string=\"true\">2026-10-",
+      "08",
+      "</｜DSML｜parameter><｜DSML｜parameter name=\"city\" "
+      "string=\"true\">Bei",
+      "jing</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>"};
+
+  std::string accumulated_args;
+  int32_t tool_calls_found = 0;
+  for (const std::string& chunk : chunks) {
+    StreamingParseResult result =
+        v4_detector_->parse_streaming_increment(chunk, tools_);
+    for (const ToolCallItem& call : result.calls) {
+      if (call.name.has_value()) {
+        ++tool_calls_found;
+        EXPECT_EQ(call.name.value(), "get_weather");
+      } else {
+        accumulated_args += call.parameters;
+      }
+    }
+  }
+
+  EXPECT_EQ(tool_calls_found, 1);
+  nlohmann::json params =
+      nlohmann::json::parse(accumulated_args, nullptr, false);
+  ASSERT_FALSE(params.is_discarded()) << accumulated_args;
+  EXPECT_EQ(params["city"], "Beijing");
+  EXPECT_EQ(params["date"], "2026-10-08");
+}
+
+TEST_F(DeepSeek32DetectorTest, StreamingArgumentsStayValidWhenKeysReorder) {
+  std::vector<std::string> chunks = {
+      "<｜DSML｜function_calls><｜DSML｜invoke name=\"get_weather\">"
+      "<｜DSML｜parameter name=\"date\" string=\"true\">2026-10-",
+      "08",
+      "</｜DSML｜parameter><｜DSML｜parameter name=\"city\" "
+      "string=\"true\">Bei",
+      "jing</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>"};
+
+  std::string accumulated_args;
+  for (const std::string& chunk : chunks) {
+    StreamingParseResult result =
+        detector_->parse_streaming_increment(chunk, tools_);
+    for (const ToolCallItem& call : result.calls) {
+      if (!call.name.has_value()) {
+        accumulated_args += call.parameters;
+      }
+    }
+  }
+
+  nlohmann::json params =
+      nlohmann::json::parse(accumulated_args, nullptr, false);
+  ASSERT_FALSE(params.is_discarded()) << accumulated_args;
+  EXPECT_EQ(params["city"], "Beijing");
+  EXPECT_EQ(params["date"], "2026-10-08");
 }
 
 }  // namespace function_call

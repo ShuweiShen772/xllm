@@ -114,8 +114,7 @@ std::pair<std::string, std::string> DeepSeekV32Detector::split_incomplete_utf8(
   return {str.substr(0, start_pos), str.substr(start_pos)};
 }
 
-// Dump parameters to JSON string with sorted keys for stable prefix comparison
-// across streaming chunks (unordered_map iteration order is undefined).
+// Serialize completed parameters in a deterministic key order.
 static std::string params_to_json_sorted(
     const std::unordered_map<std::string, nlohmann::json>& params) {
   std::vector<std::string> keys;
@@ -1070,76 +1069,24 @@ StreamingParseResult DeepSeekV32Detector::parse_streaming_increment(
       // Initialize state if this is the first tool call
       if (current_tool_id_ == -1) {
         current_tool_id_ = 0;
-        prev_tool_call_arr_.clear();
-        streamed_args_for_tool_.clear();
-        streamed_args_for_tool_.push_back("");
         current_tool_name_sent_ = false;
       }
 
-      // Ensure arrays are large enough for current tool
-      while (prev_tool_call_arr_.size() <=
-             static_cast<size_t>(current_tool_id_)) {
-        prev_tool_call_arr_.push_back({});
-      }
-      while (streamed_args_for_tool_.size() <=
-             static_cast<size_t>(current_tool_id_)) {
-        streamed_args_for_tool_.push_back("");
-      }
-
-      // 1. Send tool name if not sent yet
+      // Send tool name as soon as it is available.
       if (!current_tool_name_sent_) {
         all_calls.push_back(ToolCallItem(current_tool_id_, func_name, ""));
         current_tool_name_sent_ = true;
       }
 
-      // 2. Parse current parameters (partial or complete)
-      auto current_params =
-          parse_parameters_from_xml(invoke_content, !is_tool_end);
-      // Use sorted-key dump so find_common_prefix is stable across chunks
-      std::string current_args_json = params_to_json_sorted(current_params);
-
-      // 3. Calculate and send incremental arguments
-      size_t sent_len = streamed_args_for_tool_[current_tool_id_].length();
-      std::string argument_diff;
-
+      // Partial parameters can change earlier JSON bytes (for example, when a
+      // later parameter sorts before an earlier one). Stream arguments only
+      // after the invoke closes, when their serialized form is final.
       if (is_tool_end) {
-        // If complete, send everything remaining
-        if (sent_len < current_args_json.length()) {
-          argument_diff = current_args_json.substr(sent_len);
-        }
-      } else {
-        // If partial, send stable prefix diff
-        if (prev_tool_call_arr_[current_tool_id_].find("arguments") !=
-            prev_tool_call_arr_[current_tool_id_].end()) {
-          std::string prev_args_json =
-              prev_tool_call_arr_[current_tool_id_]["arguments"];
-
-          if (current_args_json != prev_args_json) {
-            std::string prefix =
-                find_common_prefix(prev_args_json, current_args_json);
-            if (prefix.length() > sent_len) {
-              argument_diff = prefix.substr(sent_len);
-            }
-          }
-        }
-      }
-
-      if (!argument_diff.empty()) {
-        auto [complete_argument_diff, incomplete_tail] =
-            split_incomplete_utf8(argument_diff);
-        (void)incomplete_tail;
-        argument_diff = std::move(complete_argument_diff);
-      }
-
-      if (!argument_diff.empty()) {
+        auto params = parse_parameters_from_xml(invoke_content, false);
+        std::string arguments = params_to_json_sorted(params);
         all_calls.push_back(
-            ToolCallItem(current_tool_id_, std::nullopt, argument_diff));
-        streamed_args_for_tool_[current_tool_id_] += argument_diff;
+            ToolCallItem(current_tool_id_, std::nullopt, arguments));
       }
-
-      // Update the stored arguments (store as JSON string)
-      prev_tool_call_arr_[current_tool_id_]["name"] = func_name;
-      prev_tool_call_arr_[current_tool_id_]["arguments"] = current_args_json;
 
       // Check if tool call is complete (has closing tag)
       if (is_tool_end) {
